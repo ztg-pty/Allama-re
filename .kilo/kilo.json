@@ -1,0 +1,36 @@
+{
+  "$schema": "https://app.kilo.ai/config.json",
+  "mcp": {
+    "playwright": {
+      "type": "local",
+      "command": ["npx", "@playwright/mcp"],
+      "enabled": true
+    },
+    "postgres": {
+      "type": "local",
+      "command": ["npx", "@modelcontextprotocol/server-postgres", "postgresql://localhost:5432/vpn_db"],
+      "enabled": true
+    },
+    "github": {
+      "type": "local",
+      "command": ["npx", "@modelcontextprotocol/server-github", "--token", "YOUR_GITHUB_TOKEN"],
+      "enabled": true
+    },
+    "sequential-thinking": {
+      "type": "local",
+      "command": ["npx", "@modelcontextprotocol/server-sequential-thinking"],
+      "enabled": true
+    },
+    "context7": {
+      "type": "local",
+      "command": ["npx", "@upstash/context7-mcp"],
+      "env": {
+        "CONTEXT7_API_KEY": "box_2845beb8fdd8f55a37856c0c31ab6f76cf41887eeef3f5791ec62a11afcf6595"
+      },
+      "enabled": true
+    }
+  },
+  "commit_message": {
+    "prompt": ""
+  }
+}
