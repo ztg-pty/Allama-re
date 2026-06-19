@@ -42,7 +42,6 @@ allama/
 │   ├── llama-server.exe     # 推理服务器
 │   ├── *.dll                # llama.cpp CUDA/CPU 后端
 │   └── Debug/app.log        # 应用日志
-├── Web/                     # WebView2 运行时
 ├── docs/                    # 文档
 └── _runtime/                # 运行时辅助模块（日志等）
 ```
@@ -60,6 +59,7 @@ allama/
 ```bash
 pip install -r requirements.txt
 ```
+并且运行RUN ME.bat
 
 依赖项:
 - `PySide6>=6.5.0` — Qt6 Python 绑定
