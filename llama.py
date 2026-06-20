@@ -55,9 +55,18 @@ OPENAI_DEFAULT_PORT = 8080
 OLLAMA_DEFAULT_PORT = 7890
 
 POLL_INTERVAL = 0.1
+MAX_PORT_SEARCH = 50
+
+# 网络常量
+DEFAULT_BUFFER_SIZE = 65536
+API_TIMEOUT = 600  # 秒
+MAX_CONNECTIONS = 16
+
+# 日志常量
+MAX_LOG_LINES = 5000
+LOG_FLUSH_INTERVAL = 80  # 毫秒
 
 _logger = logging.getLogger("llama")
-MAX_PORT_SEARCH = 50
 class AppSettings:
     _FILE = _EXE_DIR / "settings.json"
     _DEFAULTS = {
@@ -166,23 +175,27 @@ class BatParamMapper:
 
     @classmethod
     def get_model_config(cls, filename: str) -> dict:
-        base = Path(filename).stem
+        """获取模型配置，根据文件名中的量化类型自动应用优化参数"""
+        base_name = Path(filename).stem
+        
+        # 查找匹配的量化类型
         for qual_name, params in cls.GENE_MAP.items():
-            if qual_name in base:
-                model_name = base.replace("-" + qual_name, "")
-                return {
-                    "model_path": filename,
-                    "model_name": base,
-                    "display_name": base,
-                    "fixed_params": dict(cls.FIXED_PARAMS),
-                    "base_params": {**params},
-                }
+            if qual_name in base_name:
+                final_model_name = base_name.replace("-" + qual_name, "")
+                return cls._build_config(filename, final_model_name, base_name, params)
+        
+        # 默认配置
+        return cls._build_config(filename, base_name, base_name, cls.DEFAULT_PARAMS)
+    
+    @classmethod
+    def _build_config(cls, filename: str, final_name: str, display_name: str, base_params: dict) -> dict:
+        """构建模型配置字典"""
         return {
             "model_path": filename,
-            "model_name": Path(filename).stem,
-            "display_name": Path(filename).stem,
+            "model_name": final_name,
+            "display_name": display_name,
             "fixed_params": dict(cls.FIXED_PARAMS),
-            "base_params": dict(cls.DEFAULT_PARAMS),
+            "base_params": base_params,
         }
 
     @classmethod
@@ -374,6 +387,7 @@ class DeploymentManager:
         self._current_port = OPENAI_DEFAULT_PORT
         self._error_detected = None
         self._lock = threading.Lock()
+        self._model_params_cache = None
 
     @property
     def is_running(self) -> bool:
@@ -652,16 +666,20 @@ class ApiServer:
                 pass
 
     def _run_loop(self):
+        """服务器主循环"""
         self._server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._server_sock.settimeout(1.0)
+        
         try:
             self._server_sock.bind(("127.0.0.1", self.port))
-            self._server_sock.listen(16)
+            self._server_sock.listen(MAX_CONNECTIONS)
         except OSError as e:
             self._log(f"Ollama API 端口 {self.port} 绑定失败: {e}")
             return
+        
         self._log(f"Ollama API 已启动于 http://localhost:{self.port}")
+        
         while not self._stop_event.is_set():
             try:
                 client_sock, addr = self._server_sock.accept()
@@ -669,31 +687,36 @@ class ApiServer:
                 threading.Thread(target=self._handle, args=(client_sock,), daemon=True).start()
             except OSError:
                 break
+        
         try:
             self._server_sock.close()
         except Exception:
             pass
 
-    def _handle(self, client_sock):
+    def _handle(self, client_sock: socket.socket):
+        """处理客户端请求"""
         try:
-            raw = client_sock.recv(65536)
-            self._logger.debug("收到客户端请求, 长度: %d bytes", len(raw) if raw else 0)
+            raw = client_sock.recv(DEFAULT_BUFFER_SIZE)
             self._logger.debug("收到客户端请求, 长度: %d bytes", len(raw) if raw else 0)
             if not raw:
                 client_sock.close()
                 return
+            
             headers, body = raw.split(b"\r\n\r\n", 1) if b"\r\n\r\n" in raw else (raw, b"")
             header_lines = headers.split(b"\r\n")
             request_line = header_lines[0].decode("utf-8", errors="replace")
             parts = request_line.split(" ")
+            
             if len(parts) < 2:
                 client_sock.close()
                 return
+            
             path = parts[1]
             try:
                 data = json.loads(body.decode("utf-8", errors="replace")) if body else {}
             except json.JSONDecodeError:
                 data = {}
+            
             path_lower = path.lower().rstrip("/")
             if path_lower in ("/api/chat", "/api/generate"):
                 self._handle_llama(data, client_sock)
@@ -709,21 +732,32 @@ class ApiServer:
             except Exception:
                 pass
 
-    def _handle_llama(self, data, client_sock):
-        is_stream = data.get("stream", False)
+    def _handle_llama(self, data: dict, client_sock: socket.socket):
+        """处理 /api/chat 和 /api/generate 请求"""
         model_name = data.get("model", self.model_name)
-        self._logger.info("Ollama API 请求: model=%s, stream=%s, prompt_len=%d", model_name, is_stream, len(data.get("prompt", "")))
-        conv_data = {"prompt": data.get("prompt", ""), "n_predict": data.get("n_predict", 2048),
-                     "temperature": data.get("temperature", 0.7), "stream": is_stream, "model": model_name}
+        self._logger.info("Ollama API 请求: model=%s, stream=%s, prompt_len=%d", model_name, data.get("stream", False), len(data.get("prompt", "")))
+        
+        conv_data = {
+            "prompt": data.get("prompt", ""),
+            "n_predict": data.get("n_predict", 2048),
+            "temperature": data.get("temperature", 0.7),
+            "stream": data.get("stream", False),
+            "model": model_name
+        }
+        
         url = f"http://127.0.0.1:{self.llama_port}/generate"
         req = urllib.request.Request(url, data=json.dumps(conv_data).encode("utf-8"),
                                      headers={"Content-Type": "application/json"}, method="POST")
+        
         try:
-            with urllib.request.urlopen(req, timeout=600) as resp:
+            with urllib.request.urlopen(req, timeout=API_TIMEOUT) as resp:
                 result = json.loads(resp.read().decode("utf-8", errors="replace"))
+            
             resp_data = {
-                "model": model_name, "created_at": datetime.now().isoformat(),
-                "message": result.get("content", ""), "done": True,
+                "model": model_name,
+                "created_at": datetime.now().isoformat(),
+                "message": result.get("content", ""),
+                "done": True,
                 "total_duration": result.get("tokens_evaluated", 1) * 1_000_000,
                 "prompt_eval_count": result.get("prompt_tokens", 0),
                 "eval_count": result.get("tokens_predicted", 0),
@@ -739,12 +773,12 @@ class ApiServer:
                            "digest": "sha256:0" * 32}]}
         self._send(client_sock, 200, json.dumps(tags, ensure_ascii=False).encode("utf-8"))
 
-    def _log(self, msg):
+    def _log(self, msg: str):
+        """记录日志到 UI 和日志系统"""
         try:
             self.log_callback(msg, "info")
         except Exception:
             pass
-        self._logger.info(msg)
         self._logger.info(msg)
 
     @staticmethod
